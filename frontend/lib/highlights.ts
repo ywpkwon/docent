@@ -11,9 +11,10 @@ export function createHighlight(
   color: HighlightColor,
   text: string,
   note = "",
-  rects?: HighlightRect[]
+  rects?: HighlightRect[],
+  source?: "tour",
 ): Highlight {
-  return { id: newId(), page, color, text, note, timestamp: Date.now(), rects };
+  return { id: newId(), page, color, text, note, timestamp: Date.now(), rects, source };
 }
 
 export function highlightFill(legends: Legend[], color: string): string {

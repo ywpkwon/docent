@@ -398,7 +398,7 @@ export function CommandBar({ isOpen, onClose, onSubmit, paper, legends, highligh
 
           {phase === "response" && (
             <>
-              <span style={{ color: "var(--accent)", fontWeight: 700, userSelect: "none" }}>PaperPal</span>
+              <span style={{ color: "var(--accent)", fontWeight: 700, userSelect: "none" }}>Docent</span>
               <span style={{ color: "var(--text-muted)" }}>→</span>
               <span style={{ flex: 1, color: "var(--text)" }}>{response}</span>
               <span style={{ color: "var(--text-muted)", fontSize: 11, whiteSpace: "nowrap" }}>

@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "PaperPal — Voice Research Companion",
+  title: "Docent — Voice Research Companion",
   description: "Upload a PDF, start talking. Your paper responds.",
 };
 

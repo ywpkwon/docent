@@ -951,10 +951,10 @@ export function PDFViewer({
 
           // Debug
           console.log(
-            `[PaperPal] ${links.length} citation links on ref pages:`,
+            `[Docent] ${links.length} citation links on ref pages:`,
             Array.from(refPages).sort((a, b) => a - b).map(p => `p.${p + 1}`).join(', ')
           );
-          console.log('[PaperPal] links:', links.map(l => `${l.id}(${l.label})→p.${l.destPage + 1}`).join('  '));
+          console.log('[Docent] links:', links.map(l => `${l.id}(${l.label})→p.${l.destPage + 1}`).join('  '));
 
           onLinksReadyRef.current(links);
         }

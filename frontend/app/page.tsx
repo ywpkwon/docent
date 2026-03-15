@@ -10,6 +10,7 @@ import { HighlightsPanel } from "@/components/HighlightsPanel";
 import { UploadZone } from "@/components/UploadZone";
 import { PreferencesModal } from "@/components/PreferencesModal";
 import { QuickLink } from "@/components/QuickLink";
+import { TourPlayer } from "@/components/TourPlayer";
 import { createHighlight, exportToObsidian } from "@/lib/highlights";
 import { loadLegends, saveLegends } from "@/lib/legends";
 import { parseCommand, type ParsedCommand } from "@/lib/commands";
@@ -22,6 +23,7 @@ import type {
   Legend,
   ParsedPaper,
   PdfLink,
+  TourEvent,
   VoiceAction,
   VoiceStatus,
 } from "@/lib/types";
@@ -60,6 +62,11 @@ export default function Home() {
   const [quickLinkOpen, setQuickLinkOpen] = useState(false);
   const [highlightsOpen, setHighlightsOpen] = useState(false);
   const [legends, setLegends]           = useState<Legend[]>(() => loadLegends());
+
+  const [tourPicking, setTourPicking] = useState(false);
+  const [tourLoading, setTourLoading] = useState(false);
+  const [tourError, setTourError] = useState<string | null>(null);
+  const [tourData, setTourData] = useState<{ narration: string; timeline: TourEvent[]; duration: "1min" | "2min" } | null>(null);
 
   const [restoring, setRestoring] = useState(true);
 
@@ -248,15 +255,91 @@ export default function Home() {
     fileMetaRef.current = null;
   }, []);
 
+  const startTour = useCallback(async (duration: "1min" | "2min") => {
+    if (!paper) return;
+    setTourPicking(false);
+    setTourLoading(true);
+    setTourError(null);
+    try {
+      // Send a compact paper context instead of the full system_prompt to minimise token usage.
+      const sectionLines = paper.pages
+        .filter((p) => p.section_title)
+        .map((p) => `  p.${p.page + 1}: ${p.section_title}`)
+        .join("\n");
+      const paperContext = [
+        `Title: ${paper.title}`,
+        `Abstract: ${paper.abstract.slice(0, 600)}`,
+        sectionLines ? `Sections:\n${sectionLines}` : "",
+      ].filter(Boolean).join("\n\n");
+
+      const res = await fetch(`${BACKEND_URL}/api/tour`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          system_prompt: paperContext,
+          duration,
+          figures: figures.map((f) => ({ id: f.id, label: f.label, page: f.page })),
+          pdf_links: pdfLinks.map((l) => ({ id: l.id, label: l.label, destPage: l.destPage })),
+        }),
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        const detail: string = errBody.detail ?? `HTTP ${res.status}`;
+        const isQuota = detail.includes("429") || detail.includes("RESOURCE_EXHAUSTED");
+        const isExhausted = isQuota && detail.includes("limit: 0");
+        const msg = isExhausted
+          ? "Gemini free-tier quota exhausted. Enable billing at ai.google.dev, or set TOUR_MODEL in .env to a model with remaining quota."
+          : isQuota
+          ? "Gemini rate limit — wait ~30s and try again."
+          : detail.includes("API key") ? "Gemini API key not configured."
+          : `Tour generation failed (${res.status}).`;
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      if (!data.narration) throw new Error("Gemini returned an empty tour — try again.");
+      setTourData({ narration: data.narration, timeline: data.timeline ?? [], duration });
+    } catch (err) {
+      setTourError(err instanceof Error ? err.message : "Tour generation failed.");
+    } finally {
+      setTourLoading(false);
+    }
+  }, [paper, figures, pdfLinks]);
+
+  const handleTourCommand = useCallback((rawCmd: string) => {
+    // highlight color "text" page  — our preferred format
+    const m1 = rawCmd.match(/^highlight\s+(\w+)\s+"([^"]+)"\s+(\d+)$/);
+    // highlight "text" color page  — Gemini sometimes swaps order
+    const m2 = rawCmd.match(/^highlight\s+"([^"]+)"\s+(\w+)\s+(\d+)$/);
+    const [color, text, pageStr] = m1
+      ? [m1[1], m1[2], m1[3]]
+      : m2 ? [m2[2], m2[1], m2[3]] : [];
+    if (color && text && pageStr) {
+      const page = parseInt(pageStr, 10) - 1;
+      setHighlights((prev) => [
+        ...prev,
+        createHighlight(page, color as HighlightColor, text, "", undefined, "tour"),
+      ]);
+      return;
+    }
+    // Regular command (go_page, show_link, etc.)
+    const cmd = parseCommand(rawCmd);
+    if (cmd && cmd.name !== "none") {
+      if (cmd.name === "go_page") setLinkPopup(null);
+      executeCommand(cmd);
+    }
+  }, [executeCommand]);
+
   // Global keybinds
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (commandBarOpen || helpOpen || quickLinkOpen || highlightsOpen || showPrefs) return;
+      if (commandBarOpen || helpOpen || quickLinkOpen || highlightsOpen || showPrefs || tourPicking || tourLoading || !!tourData) return;
+      if (e.key === "Escape" && tourError) { setTourError(null); return; }
       if ((e.target as HTMLElement).closest("input, textarea, [contenteditable]")) return;
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === ":") { e.preventDefault(); setCommandBarOpen(true); }
       if (e.key === "?") { e.preventDefault(); setHelpOpen(true); }
       if (e.key === "f" && paper) { e.preventDefault(); setQuickLinkOpen(true); }
+      if (e.key === "t" && paper) { e.preventDefault(); setTourPicking(true); }
       if (e.key === "h" && paper) { e.preventDefault(); setHighlightsOpen(true); }
       if (e.key === "H" && paper) { e.preventDefault(); setShowPrefs(true); }
       if (e.key === "p" && paper) { e.preventDefault(); setShowPrefs(true); }
@@ -266,7 +349,7 @@ export default function Home() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [commandBarOpen, helpOpen, quickLinkOpen, highlightsOpen, showPrefs, paper, handleExportObsidian, handleCloseDocument]);
+  }, [commandBarOpen, helpOpen, quickLinkOpen, highlightsOpen, showPrefs, tourPicking, tourLoading, tourData, paper, handleExportObsidian, handleCloseDocument]);
 
   const handleCommand = useCallback(async (text: string): Promise<{ speech: string } | null> => {
     if (!paper) return null;
@@ -435,6 +518,87 @@ export default function Home() {
         @keyframes spin { to { transform: rotate(360deg); } }
         @keyframes vsPing { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
       `}</style>
+
+      {/* Tour picker */}
+      {tourPicking && (
+        <div
+          style={{ position: "fixed", inset: 0, zIndex: 9500, background: "rgba(0,0,0,0.5)",
+            display: "flex", alignItems: "center", justifyContent: "center" }}
+          onClick={() => setTourPicking(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "var(--surface-2)", border: "1px solid var(--border)",
+              borderRadius: 10, padding: "24px 28px",
+              boxShadow: "0 20px 60px rgba(0,0,0,0.4)",
+              fontFamily: "ui-monospace, 'Cascadia Code', monospace",
+              display: "flex", flexDirection: "column", gap: 16,
+              minWidth: 280,
+            }}
+          >
+            <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text)" }}>Guided tour</div>
+            <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>
+              Docent narrates the paper, navigates pages, and<br />adds highlight suggestions as it talks.
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              {(["1min", "2min"] as const).map((d) => (
+                <button
+                  key={d}
+                  onClick={() => startTour(d)}
+                  style={{
+                    flex: 1, padding: "10px 0", borderRadius: 6, fontSize: 13, fontWeight: 600,
+                    background: "var(--accent)", color: "white", border: "none", cursor: "pointer",
+                  }}
+                >
+                  {d === "1min" ? "1-min" : "2-min"} tour
+                </button>
+              ))}
+            </div>
+            <div style={{ fontSize: 10, color: "var(--text-muted)", textAlign: "center" }}>Esc to cancel</div>
+          </div>
+        </div>
+      )}
+
+      {/* Tour loading / error */}
+      {(tourLoading || tourError) && (
+        <div style={{
+          position: "fixed", bottom: 20, left: "50%", transform: "translateX(-50%)",
+          zIndex: 8500,
+          display: "flex", alignItems: "center", gap: 10,
+          background: "var(--surface-2)", border: `1px solid ${tourError ? "rgba(239,68,68,0.4)" : "var(--border)"}`,
+          borderRadius: 10, padding: "12px 20px",
+          boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+          fontFamily: "ui-monospace, monospace", fontSize: 12,
+          color: tourError ? "#f87171" : "var(--text-muted)",
+        }}>
+          {tourLoading && (
+            <div style={{
+              width: 14, height: 14, borderRadius: "50%",
+              border: "2px solid var(--accent)", borderTopColor: "transparent",
+              animation: "spin 0.8s linear infinite", flexShrink: 0,
+            }} />
+          )}
+          {tourError ? tourError : "Generating tour…"}
+          {tourError && (
+            <button onClick={() => setTourError(null)} style={{
+              marginLeft: 8, fontSize: 13, background: "none", border: "none",
+              color: "#f87171", cursor: "pointer", opacity: 0.7, lineHeight: 1,
+            }}>×</button>
+          )}
+        </div>
+      )}
+
+      {/* Tour player */}
+      {tourData && (
+        <TourPlayer
+          narration={tourData.narration}
+          timeline={tourData.timeline}
+          duration={tourData.duration}
+          onCommand={handleTourCommand}
+          onClose={() => setTourData(null)}
+        />
+      )}
     </div>
   );
 }

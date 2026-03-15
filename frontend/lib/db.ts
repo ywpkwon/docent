@@ -7,7 +7,7 @@
 
 import type { FigureBBox, Highlight, ParsedPaper } from "./types";
 
-const DB_NAME   = "paperpal";
+const DB_NAME   = "docent";
 const STORE     = "session";
 const KEY       = "current";
 const SCHEMA_V  = 1; // ← bump to wipe stored data on breaking changes

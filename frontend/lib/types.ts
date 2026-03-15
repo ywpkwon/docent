@@ -20,6 +20,7 @@ export interface Highlight {
   note: string;
   timestamp: number;
   rects?: HighlightRect[];
+  source?: "tour";
 }
 
 export interface FigureBBox {
@@ -70,3 +71,8 @@ export type WsMessage =
   | { type: "error"; message: string };
 
 export type VoiceStatus = "idle" | "listening" | "thinking" | "speaking" | "interrupted" | "connecting";
+
+export interface TourEvent {
+  at_char: number;
+  cmd: string;
+}

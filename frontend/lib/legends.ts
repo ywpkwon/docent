@@ -9,7 +9,7 @@ export const DEFAULT_LEGENDS: Legend[] = [
   { id: "other",      label: "Other",      hex: "#d8b4fe", borderHex: "#9333ea" }, // purple
 ];
 
-const STORAGE_KEY = "paperpal:legends";
+const STORAGE_KEY = "docent:legends";
 
 export function loadLegends(): Legend[] {
   if (typeof window === "undefined") return DEFAULT_LEGENDS;

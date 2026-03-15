@@ -23,18 +23,18 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from parse import ParsedPaper, parse_pdf, build_system_prompt, run_command  # noqa: E402
+from parse import ParsedPaper, parse_pdf, build_system_prompt, run_command, generate_tour  # noqa: E402
 from voice_proxy import run_voice_session  # noqa: E402
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("PaperPal backend starting up")
+    logger.info("Docent backend starting up")
     yield
-    logger.info("PaperPal backend shutting down")
+    logger.info("Docent backend shutting down")
 
 
-app = FastAPI(title="PaperPal API", lifespan=lifespan)
+app = FastAPI(title="Docent API", lifespan=lifespan)
 
 cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 app.add_middleware(
@@ -130,6 +130,40 @@ async def parse_endpoint(file: UploadFile = File(...)):
         ],
         "system_prompt": system_prompt,
     }
+
+
+class TourFigure(BaseModel):
+    id: str
+    label: str = ""
+    page: int  # 0-based
+
+
+class TourLink(BaseModel):
+    id: str
+    label: str = ""
+    destPage: int  # 0-based
+
+
+class TourRequest(BaseModel):
+    system_prompt: str
+    duration: str = "1min"  # "1min" or "2min"
+    figures: list[TourFigure] = []
+    pdf_links: list[TourLink] = []
+
+
+@app.post("/api/tour")
+async def tour_endpoint(req: TourRequest):
+    """Generate a narrated guided tour: narration text + timed command timeline."""
+    try:
+        return await generate_tour(
+            req.system_prompt,
+            req.duration,
+            [f.model_dump() for f in req.figures],
+            [l.model_dump() for l in req.pdf_links],
+        )
+    except Exception as exc:
+        logger.exception("Tour generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.websocket("/ws/voice")

@@ -1,5 +1,5 @@
 /**
- * PaperPal canonical command vocabulary.
+ * Docent canonical command vocabulary.
  *
  * Both Gemini (text/voice) and users typing directly target these commands.
  * To add a new command:

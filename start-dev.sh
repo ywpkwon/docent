@@ -9,8 +9,10 @@ fi
 
 source .env
 export GEMINI_API_KEY
+export TOUR_MODEL
+export PARSE_MODEL
 
-echo "Starting PaperPal dev environment..."
+echo "Starting Docent dev environment..."
 echo ""
 
 # Backend
@@ -23,7 +25,7 @@ echo ""
   source .venv/bin/activate
   pip install -q -r requirements.txt
   echo "[backend] Starting FastAPI on :8000"
-  GEMINI_API_KEY="$GEMINI_API_KEY" uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+  GEMINI_API_KEY="$GEMINI_API_KEY" TOUR_MODEL="$TOUR_MODEL" PARSE_MODEL="$PARSE_MODEL" uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ) &
 BACKEND_PID=$!
 
@@ -43,6 +45,6 @@ BACKEND_PID=$!
 FRONTEND_PID=$!
 
 trap "kill $BACKEND_PID $FRONTEND_PID 2>/dev/null" INT TERM
-echo "PaperPal running at http://localhost:3000"
+echo "Docent running at http://localhost:3000"
 echo "Press Ctrl+C to stop."
 wait

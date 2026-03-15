@@ -79,12 +79,13 @@ export function HighlightsPanel({ highlights, legends, currentHighlightId, onClo
                     key={hl.id}
                     ref={active ? activeRef : undefined}
                     style={{ borderRadius: 6, padding: "6px 8px", cursor: "pointer",
-                      background: fill, border: `${active ? 2 : 1}px solid ${border}` }}
+                      background: fill, border: `${active ? 2 : 1}px ${hl.source === "tour" ? "dashed" : "solid"} ${border}` }}
                     onClick={() => { onNavigate(hl.page); onClose(); }}
                   >
                     <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 4 }}>
                       <span style={{ fontSize: 11, fontWeight: 600, color: "#1e293b" }}>
                         {active && <span style={{ marginRight: 3 }}>▶</span>}
+                        {hl.source === "tour" && <span style={{ marginRight: 4, fontSize: 9, opacity: 0.7 }}>tour</span>}
                         p.{hl.page + 1} · {label}
                       </span>
                       <button

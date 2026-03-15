@@ -27,6 +27,7 @@ _CAPTION_RE = re.compile(
 logger = logging.getLogger(__name__)
 
 PARSE_MODEL = os.getenv("PARSE_MODEL", "gemini-2.0-flash")
+TOUR_MODEL  = os.getenv("TOUR_MODEL",  "gemini-2.0-flash")
 
 # Prompt sent to Gemini Vision for each page
 PAGE_PARSE_PROMPT = """\
@@ -512,4 +513,119 @@ async def run_command(
 ) -> dict[str, Any]:
     return await asyncio.to_thread(
         _run_command_sync, user_message, system_prompt, current_page, page_count
+    )
+
+
+# ── Tour generation ──────────────────────────────────────────────────────────
+
+_TOUR_PROMPT = """\
+{system_prompt}
+
+---
+You are creating a {duration} narrated guided tour of the paper above.
+
+Generate a narration of approximately {word_count} words (≈{duration} at 150 words/minute) that covers:
+1. The core problem and motivation (why does this paper exist?)
+2. The key method or approach
+3. Main results and takeaways
+4. 1–2 notable figures (if available)
+
+Also generate a timeline of viewer commands that fire as the narration plays.
+
+Available figures:
+{figure_list}
+
+Available reference IDs: {link_list}
+
+Output ONLY valid JSON — no markdown, no code fences:
+{{
+  "narration": "<full narration text, ~{word_count} words>",
+  "timeline": [
+    {{
+      "at_char": 0,
+      "cmd": "go_page 1"
+    }}
+  ]
+}}
+
+Timeline rules:
+- at_char is the 0-based character index in narration where this command fires (must be ≥ 0 and < len(narration))
+- Multiple commands at the same at_char are allowed (list them as separate objects)
+- Available commands:
+    go_page <n>                       — navigate to page n (1-indexed)
+    show_link <id>                    — pop up a figure or reference preview (use figure IDs from list above)
+    highlight <color> "<text>" <page> — suggest a highlight (page is 1-indexed)
+      color must be one of: agree | disagree | comment | question | definition | other
+      text should be a short phrase (3–8 words) from or about the paper
+- Include 3–5 highlight suggestions spread across the narration
+- Include show_link for 1–3 figures if they exist
+- Navigate to relevant pages as you narrate them (start with go_page 1)
+- Use "definition" for key terms/concepts, "comment" for interesting points, "question" for open questions, "agree" for strong results
+- First event must be {{"at_char": 0, "cmd": "go_page 1"}}
+"""
+
+
+def _generate_tour_sync(
+    system_prompt: str,
+    duration: str,
+    figures: list[dict],
+    pdf_links: list[dict],
+) -> dict[str, Any]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    client = genai.Client(api_key=api_key)
+
+    word_count = 150 if duration == "1min" else 300
+    figure_list = "\n".join(
+        f"  - {f['id']} (page {f['page'] + 1}): {str(f.get('label', ''))[:80]}"
+        for f in figures[:20]
+    ) or "  (none detected)"
+    link_list = ", ".join(
+        f"{l['id']} (p.{l['destPage'] + 1})" for l in pdf_links[:15]
+    ) or "(none)"
+
+    prompt = _TOUR_PROMPT.format(
+        system_prompt=system_prompt,
+        duration=duration,
+        word_count=word_count,
+        figure_list=figure_list,
+        link_list=link_list,
+    )
+
+    response = client.models.generate_content(
+        model=TOUR_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.5,
+            response_mime_type="application/json",
+        ),
+    )
+
+    data = _parse_json_safe((response.text or "").strip())
+    narration: str = data.get("narration") or ""
+    raw_timeline: list = data.get("timeline") or []
+
+    # Validate and clamp at_char values
+    n_len = max(1, len(narration))
+    timeline = []
+    for event in raw_timeline:
+        at_char = event.get("at_char")
+        cmd = str(event.get("cmd") or "").strip()
+        if isinstance(at_char, (int, float)) and cmd:
+            timeline.append({"at_char": max(0, min(int(at_char), n_len - 1)), "cmd": cmd})
+
+    timeline.sort(key=lambda e: e["at_char"])
+    return {"narration": narration, "timeline": timeline}
+
+
+async def generate_tour(
+    system_prompt: str,
+    duration: str,
+    figures: list[dict],
+    pdf_links: list[dict],
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _generate_tour_sync, system_prompt, duration, figures, pdf_links
     )

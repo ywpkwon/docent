@@ -15,6 +15,7 @@ const KEYBINDS: { key: string; description: string }[] = [
   { key: "m",   description: "Mic toggle" },
   { key: "p",   description: "Preferences" },
   { key: "f",   description: "Quick link browser (FZF)" },
+  { key: "t",   description: "Guided tour (1-min / 2-min narration with highlights)" },
   { key: ":",   description: "Command bar" },
   { key: "?",   description: "This help" },
 ];

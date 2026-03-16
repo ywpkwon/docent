@@ -39,6 +39,10 @@ This is a deliberate constraint. The highlights you see during the tour correspo
 - **Obsidian / Zotero export** — clean path from skimming to your note system
 - **Keyboard-driven** — vim-style bindings and a command bar (`:`) throughout
 
+
+> [!NOTE]
+> Early-stage project — expect rough edges. Feedback and contributions welcome.
+
 ---
 
 ## Getting Started

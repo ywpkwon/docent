@@ -11,6 +11,7 @@ import { UploadZone } from "@/components/UploadZone";
 import { PreferencesModal } from "@/components/PreferencesModal";
 import { QuickLink } from "@/components/QuickLink";
 import { TourPlayer } from "@/components/TourPlayer";
+import { TourPlanView } from "@/components/TourPlanView";
 import { createHighlight, exportToObsidian } from "@/lib/highlights";
 import { loadLegends, saveLegends } from "@/lib/legends";
 import { parseCommand, parseNaturalCommand, type ParsedCommand } from "@/lib/commands";
@@ -24,6 +25,7 @@ import type {
   ParsedPaper,
   PdfLink,
   TourEvent,
+  TourPlanItem,
   VoiceStatus,
 } from "@/lib/types";
 
@@ -66,6 +68,11 @@ export default function Home() {
   const [tourLoading, setTourLoading] = useState(false);
   const [tourError, setTourError] = useState<string | null>(null);
   const [tourData, setTourData] = useState<{ narration: string; timeline: TourEvent[]; duration: "1min" | "2min" } | null>(null);
+  const [tourPlan, setTourPlan] = useState<TourPlanItem[] | null>(null);
+  const [tourPlanLoading, setTourPlanLoading] = useState(false);
+  const [tourPlanError, setTourPlanError] = useState<string | null>(null);
+  const [planViewOpen, setPlanViewOpen] = useState(false);
+  const [focusBand, setFocusBand] = useState<{ text: string; page: number } | null>(null);
 
   const [restoring, setRestoring] = useState(true);
 
@@ -208,6 +215,14 @@ export default function Home() {
     setHighlights((prev) => [...prev, createHighlight(page, color, text, "", rects)]);
   }, []);
 
+  const handleHighlightRects = useCallback((updates: { id: string; rects: HighlightRect[]; page?: number }[]) => {
+    setHighlights((prev) => prev.map((h) => {
+      const u = updates.find((up) => up.id === h.id);
+      if (!u) return h;
+      return { ...h, rects: u.rects, ...(u.page !== undefined ? { page: u.page } : {}) };
+    }));
+  }, []);
+
   const handleRemoveHighlight = useCallback((id: string) => {
     setHighlights((prev) => prev.filter((h) => h.id !== id));
   }, []);
@@ -231,6 +246,8 @@ export default function Home() {
     setPdfLinks([]);
     setCurrentPage(0);
     setLinkPopup(null);
+    setTourPlan(null);
+    setPlanViewOpen(false);
     pdfBlobRef.current = null;
     fileMetaRef.current = null;
   }, []);
@@ -260,6 +277,7 @@ export default function Home() {
           duration,
           figures: figures.map((f) => ({ id: f.id, label: f.label, page: f.page })),
           pdf_links: pdfLinks.map((l) => ({ id: l.id, label: l.label, destPage: l.destPage })),
+          plan_items: tourPlan ?? [],
         }),
       });
       if (!res.ok) {
@@ -278,14 +296,82 @@ export default function Home() {
       const data = await res.json();
       if (!data.narration) throw new Error("Gemini returned an empty tour — try again.");
       setTourData({ narration: data.narration, timeline: data.timeline ?? [], duration });
+      setPlanViewOpen(true);
     } catch (err) {
       setTourError(err instanceof Error ? err.message : "Tour generation failed.");
     } finally {
       setTourLoading(false);
     }
-  }, [paper, figures, pdfLinks]);
+  }, [paper, figures, pdfLinks, tourPlan]);
+
+  const startTourPlan = useCallback(async () => {
+    if (!paper) return;
+    setTourPlanLoading(true);
+    setTourPlanError(null);
+    setPlanViewOpen(true);
+    try {
+      // Build full context: title + abstract + all pages with complete text
+      const context = [
+        `Title: ${paper.title}`,
+        `\nAbstract:\n${paper.abstract}`,
+        ...paper.pages.map((p) =>
+          `\n--- Page ${p.page + 1}${p.section_title ? ` [${p.section_title}]` : ""} ---\n${p.text}`
+        ),
+      ].join("\n");
+
+      const res = await fetch(`${BACKEND_URL}/api/tour/plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          context,
+          figures: figures.map((f) => ({ id: f.id, label: f.label, page: f.page })),
+        }),
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.detail ?? `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const plan: TourPlanItem[] = data.plan ?? [];
+      setTourPlan(plan);
+
+      // Create tour highlights from plan
+      const TYPE_TO_COLOR: Record<string, string> = {
+        definition: "definition",
+        core_claim: "comment",
+        method: "other",
+        result: "comment",
+        question: "question",
+      };
+      const newHighlights = plan.map((item) =>
+        createHighlight(
+          item.page - 1,
+          (TYPE_TO_COLOR[item.type] ?? "other") as HighlightColor,
+          item.text,
+          item.note,
+          undefined,
+          "tour",
+        )
+      );
+      setHighlights((prev) => [
+        ...prev.filter((h) => h.source !== "tour"),  // replace previous tour highlights
+        ...newHighlights,
+      ]);
+    } catch (err) {
+      setTourPlanError(err instanceof Error ? err.message : "Plan generation failed.");
+    } finally {
+      setTourPlanLoading(false);
+    }
+  }, [paper, figures]);
 
   const handleTourCommand = useCallback((rawCmd: string) => {
+    // focus "text" page — dashed focus overlay (no permanent highlight)
+    const mFocus = rawCmd.match(/^focus\s+"([^"]+)"\s+(\d+)$/);
+    if (mFocus) {
+      setFocusBand({ text: mFocus[1], page: parseInt(mFocus[2], 10) - 1 });
+      return;
+    }
+
     // highlight color "text" page  — our preferred format
     const m1 = rawCmd.match(/^highlight\s+(\w+)\s+"([^"]+)"\s+(\d+)$/);
     // highlight "text" color page  — Gemini sometimes swaps order
@@ -301,10 +387,10 @@ export default function Home() {
       ]);
       return;
     }
-    // Regular command (go_page, show_link, etc.)
+    // Regular command (go_page, show_link, etc.) — clear focus band on page nav
     const cmd = parseCommand(rawCmd);
     if (cmd && cmd.name !== "none") {
-      if (cmd.name === "go_page") setLinkPopup(null);
+      if (cmd.name === "go_page") { setLinkPopup(null); setFocusBand(null); }
       executeCommand(cmd);
     }
   }, [executeCommand]);
@@ -319,7 +405,9 @@ export default function Home() {
       if (e.key === ":") { e.preventDefault(); setCommandBarOpen(true); }
       if (e.key === "?") { e.preventDefault(); setHelpOpen(true); }
       if (e.key === "f" && paper) { e.preventDefault(); setQuickLinkOpen(true); }
+      if (e.key === "T" && paper) { e.preventDefault(); startTourPlan(); }
       if (e.key === "t" && paper) { e.preventDefault(); setTourPicking(true); }
+      if (e.key === "`" && paper) { e.preventDefault(); setPlanViewOpen((v) => !v); }
       if (e.key === "h" && paper) { e.preventDefault(); setHighlightsOpen(true); }
       if (e.key === "H" && paper) { e.preventDefault(); setShowPrefs(true); }
       if (e.key === "p" && paper) { e.preventDefault(); setShowPrefs(true); }
@@ -329,7 +417,7 @@ export default function Home() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [commandBarOpen, helpOpen, quickLinkOpen, highlightsOpen, showPrefs, tourPicking, tourLoading, tourData, paper, handleExportObsidian, handleCloseDocument]);
+  }, [commandBarOpen, helpOpen, quickLinkOpen, highlightsOpen, showPrefs, tourPicking, tourLoading, tourData, paper, handleExportObsidian, handleCloseDocument, startTourPlan]);
 
   const handleCommand = useCallback(async (text: string): Promise<{ speech: string } | null> => {
     if (!paper) return null;
@@ -408,6 +496,8 @@ export default function Home() {
         onCurrentTextChange={(text) => { currentPageTextRef.current = text; }}
         onFiguresChange={setFigures}
         onLinksReady={setPdfLinks}
+        focusBand={focusBand}
+        onHighlightRects={handleHighlightRects}
       />
       <VoiceController
         ref={voiceRef}
@@ -475,6 +565,7 @@ export default function Home() {
           highlights={highlights}
           legends={legends}
           currentHighlightId={currentHighlightId}
+          pdfUrl={pdfUrl}
           onClose={() => setHighlightsOpen(false)}
           onRemove={handleRemoveHighlight}
           onNavigate={setCurrentPage}
@@ -557,16 +648,16 @@ export default function Home() {
       )}
 
       {/* Tour loading / error */}
-      {(tourLoading || tourError) && (
+      {(tourLoading || tourError || tourPlanError) && (
         <div style={{
           position: "fixed", bottom: 20, left: "50%", transform: "translateX(-50%)",
           zIndex: 8500,
           display: "flex", alignItems: "center", gap: 10,
-          background: "var(--surface-2)", border: `1px solid ${tourError ? "rgba(239,68,68,0.4)" : "var(--border)"}`,
+          background: "var(--surface-2)", border: `1px solid ${(tourError || tourPlanError) ? "rgba(239,68,68,0.4)" : "var(--border)"}`,
           borderRadius: 10, padding: "12px 20px",
           boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
           fontFamily: "ui-monospace, monospace", fontSize: 12,
-          color: tourError ? "#f87171" : "var(--text-muted)",
+          color: (tourError || tourPlanError) ? "#f87171" : "var(--text-muted)",
         }}>
           {tourLoading && (
             <div style={{
@@ -575,9 +666,9 @@ export default function Home() {
               animation: "spin 0.8s linear infinite", flexShrink: 0,
             }} />
           )}
-          {tourError ? tourError : "Generating tour…"}
-          {tourError && (
-            <button onClick={() => setTourError(null)} style={{
+          {tourError ? tourError : tourPlanError ? tourPlanError : "Generating tour…"}
+          {(tourError || tourPlanError) && (
+            <button onClick={() => { setTourError(null); setTourPlanError(null); }} style={{
               marginLeft: 8, fontSize: 13, background: "none", border: "none",
               color: "#f87171", cursor: "pointer", opacity: 0.7, lineHeight: 1,
             }}>×</button>
@@ -592,7 +683,20 @@ export default function Home() {
           timeline={tourData.timeline}
           duration={tourData.duration}
           onCommand={handleTourCommand}
-          onClose={() => setTourData(null)}
+          onClose={() => { setTourData(null); setFocusBand(null); setTourPlan(null); }}
+        />
+      )}
+
+      {planViewOpen && (
+        <TourPlanView
+          plan={tourPlan}
+          tourData={tourData ? { narration: tourData.narration, timeline: tourData.timeline } : null}
+          planLoading={tourPlanLoading}
+          tourLoading={tourLoading}
+          legends={legends}
+          onClose={() => setPlanViewOpen(false)}
+          onStartPlan={startTourPlan}
+          onStartTour={() => setTourPicking(true)}
         />
       )}
     </div>

@@ -67,3 +67,10 @@ export interface TourEvent {
   at_char: number;
   cmd: string;
 }
+
+export interface TourPlanItem {
+  page: number;  // 1-indexed
+  text: string;  // verbatim quote
+  type: "definition" | "core_claim" | "method" | "result" | "question";
+  note: string;
+}

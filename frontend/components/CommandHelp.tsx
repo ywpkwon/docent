@@ -15,7 +15,9 @@ const KEYBINDS: { key: string; description: string }[] = [
   { key: "m",   description: "Mic toggle" },
   { key: "p",   description: "Preferences" },
   { key: "f",   description: "Quick link browser (FZF)" },
-  { key: "t",   description: "Guided tour (1-min / 2-min narration with highlights)" },
+  { key: "T",   description: "Analyze paper — extract key passages (Pass 1)" },
+  { key: "t",   description: "Build guided tour from plan (Pass 2, pick duration)" },
+  { key: "`",   description: "Tour plan / script view" },
   { key: ":",   description: "Command bar" },
   { key: "?",   description: "This help" },
 ];

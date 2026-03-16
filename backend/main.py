@@ -1,11 +1,13 @@
 """
-PaperPal FastAPI backend.
+Docent FastAPI backend.
 
 Endpoints:
   POST /api/parse       — Upload PDF, parse with Gemini Vision
-  POST /api/command     — Text command → Gemini → {speech, action}
+  POST /api/command     — Text command → Gemini → {speech, command}
+  POST /api/tour/plan   — Pass 1: extract key passages → plan items
+  POST /api/tour        — Pass 2: narration + timeline (uses plan if provided)
   GET  /api/health      — Health check
-  WS   /ws/voice        — Gemini Live API proxy for voice sessions
+  WS   /ws/voice        — Gemini Live API proxy (STT only)
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from parse import ParsedPaper, parse_pdf, build_system_prompt, run_command, generate_tour  # noqa: E402
+from parse import ParsedPaper, parse_pdf, build_system_prompt, run_command, generate_tour, generate_tour_plan  # noqa: E402
 from voice_proxy import run_voice_session  # noqa: E402
 
 
@@ -144,11 +146,24 @@ class TourLink(BaseModel):
     destPage: int  # 0-based
 
 
+class TourPlanItem(BaseModel):
+    page: int       # 1-indexed
+    text: str       # verbatim quote
+    type: str       # definition|core_claim|method|result|question
+    note: str = ""
+
+
+class TourPlanRequest(BaseModel):
+    context: str                  # compact paper context built client-side
+    figures: list[TourFigure] = []
+
+
 class TourRequest(BaseModel):
     system_prompt: str
     duration: str = "1min"  # "1min" or "2min"
     figures: list[TourFigure] = []
     pdf_links: list[TourLink] = []
+    plan_items: list[TourPlanItem] = []
 
 
 @app.post("/api/tour")
@@ -160,9 +175,23 @@ async def tour_endpoint(req: TourRequest):
             req.duration,
             [f.model_dump() for f in req.figures],
             [l.model_dump() for l in req.pdf_links],
+            [p.model_dump() for p in req.plan_items] if req.plan_items else None,
         )
     except Exception as exc:
         logger.exception("Tour generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/tour/plan")
+async def tour_plan_endpoint(req: TourPlanRequest):
+    """Pass 1: Extract key passages from the paper for a guided tour."""
+    try:
+        return await generate_tour_plan(
+            req.context,
+            [f.model_dump() for f in req.figures],
+        )
+    except Exception as exc:
+        logger.exception("Tour plan generation failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

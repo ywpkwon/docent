@@ -36,7 +36,7 @@ export function UploadZone({ onUpload, uploading, error }: Props) {
         {/* Logo / title */}
         <div className="text-center">
           <h1 className="text-4xl font-bold mb-2" style={{ color: "var(--text)" }}>
-            Paper<span style={{ color: "var(--accent)" }}>Pal</span>
+            Docent
           </h1>
           <p style={{ color: "var(--text-muted)" }} className="text-sm">
             Upload a PDF. Start talking. Your paper responds.

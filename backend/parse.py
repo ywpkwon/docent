@@ -519,6 +519,118 @@ async def run_command(
 
 # ── Tour generation ──────────────────────────────────────────────────────────
 
+# ── Tour Plan (Pass 1): extract key passages ───────────────────────────────────
+
+_TOUR_PLAN_PROMPT = """\
+{context}
+
+---
+Identify the 10–14 most important passages in this paper for a guided narrated tour.
+For each, provide a SHORT verbatim quote (4–12 words) that anchors the passage.
+
+Passage types:
+  "definition"  — a key term or concept being defined
+  "core_claim"  — the paper's central claim or hypothesis
+  "method"      — how the approach or algorithm works
+  "result"      — an experimental result or quantitative achievement
+  "question"    — a limitation, open question, or future-work direction
+
+Output ONLY valid JSON (no markdown, no code fences):
+{{
+  "plan": [
+    {{
+      "text": "<4–8 word verbatim quote>",
+      "type": "<definition|core_claim|method|result|question>",
+      "note": "<one sentence: why this passage matters>"
+    }}
+  ]
+}}
+
+Rules:
+- 10–14 items
+- "text" MUST be an exact verbatim substring copied from the page text above
+- Cover the full arc: motivation → method → results → takeaways
+- Spread items across different pages where possible
+- Strongly prefer body paragraphs over figure captions, table headers, or section titles
+- Do NOT quote figure captions (lines starting with "Figure", "Fig.", "Table", "Algorithm")
+- Do NOT quote isolated section headings; anchor quotes in the body prose instead
+"""
+
+
+def _generate_tour_plan_sync(context: str, figures: list[dict]) -> dict[str, Any]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    figure_note = ""
+    if figures:
+        fig_lines = "\n".join(
+            f"  - {f['id']} (page {f['page'] + 1}): {str(f.get('label', ''))[:80]}"
+            for f in figures[:20]
+        )
+        figure_note = f"\n\nAvailable figures:\n{fig_lines}"
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=TOUR_MODEL,
+        contents=_TOUR_PLAN_PROMPT.format(context=context + figure_note),
+        config=types.GenerateContentConfig(
+            temperature=0.3,
+            response_mime_type="application/json",
+        ),
+    )
+
+    data = _parse_json_safe((response.text or "").strip())
+    raw_plan: list = data.get("plan") or []
+
+    # Parse page texts from context so we can locate each quote ourselves.
+    # Gemini is unreliable at page attribution in long contexts; text search is always correct.
+    page_texts: dict[int, str] = {}
+    for m in re.finditer(r"--- Page (\d+)[^\n]*---\n(.*?)(?=\n--- Page |\Z)", context, re.DOTALL):
+        page_texts[int(m.group(1))] = m.group(2)
+
+    def _norm(s: str) -> str:
+        """Collapse whitespace, normalize ligatures and typographic punctuation for matching."""
+        import unicodedata
+        s = unicodedata.normalize("NFKC", s)          # ﬁ→fi, ﬀ→ff, etc.
+        s = s.replace("\u2018", "'").replace("\u2019", "'")   # smart single quotes
+        s = s.replace("\u201c", '"').replace("\u201d", '"')   # smart double quotes
+        s = s.replace("\u2013", "-").replace("\u2014", "-")   # en-dash / em-dash
+        s = s.replace("\u00ad", "")                           # soft hyphen
+        return re.sub(r"\s+", " ", s).strip()
+
+    norm_pages = {pnum: _norm(txt) for pnum, txt in page_texts.items()}
+
+    plan = []
+    for item in raw_plan:
+        text = str(item.get("text") or "").strip()
+        item_type = str(item.get("type") or "other").strip()
+        note = str(item.get("note") or "").strip()
+        if not text:
+            continue
+        norm_text = _norm(text)
+        # Try exact match first, then whitespace/ligature-normalised match
+        found_page = next(
+            (pnum for pnum in sorted(page_texts) if text in page_texts[pnum]),
+            None,
+        )
+        if found_page is None:
+            found_page = next(
+                (pnum for pnum in sorted(norm_pages) if norm_text in norm_pages[pnum]),
+                None,
+            )
+        if found_page is not None:
+            plan.append({"page": found_page, "text": text, "type": item_type, "note": note})
+        else:
+            logger.warning("Tour plan: quote not found in any page, dropping: %r", text[:60])
+    plan.sort(key=lambda p: p["page"])
+    return {"plan": plan}
+
+
+async def generate_tour_plan(context: str, figures: list[dict]) -> dict[str, Any]:
+    return await asyncio.to_thread(_generate_tour_plan_sync, context, figures)
+
+
 _TOUR_PROMPT = """\
 {system_prompt}
 
@@ -555,13 +667,61 @@ Timeline rules:
 - Available commands:
     go_page <n>                       — navigate to page n (1-indexed)
     show_link <id>                    — pop up a figure or reference preview (use figure IDs from list above)
-    highlight <color> "<text>" <page> — suggest a highlight (page is 1-indexed)
+    highlight <color> "<text>" <page> — suggest a permanent highlight (page is 1-indexed)
       color must be one of: agree | disagree | comment | question | definition | other
       text should be a short phrase (3–8 words) from or about the paper
+    focus "<exact text>" <page>       — draw a temporary dashed focus box around a passage
+      text must be a SHORT (4–8 word) verbatim quote from the paper on that page
+      use this whenever you narrate a specific paragraph, abstract, or section — fires just before you discuss it
 - Include 3–5 highlight suggestions spread across the narration
+- Include 4–8 focus commands to visually highlight the passage being discussed as you narrate it
 - Include show_link for 1–3 figures if they exist
 - Navigate to relevant pages as you narrate them (start with go_page 1)
 - Use "definition" for key terms/concepts, "comment" for interesting points, "question" for open questions, "agree" for strong results
+- First event must be {{"at_char": 0, "cmd": "go_page 1"}}
+"""
+
+
+_TOUR_NARRATE_PROMPT = """\
+{system_prompt}
+
+---
+You are creating a {duration} narrated guided tour of the paper above.
+
+The following key passages have been pre-selected (visit them in order):
+{plan_list}
+
+Available figures: {figure_list}
+Available reference IDs: {link_list}
+
+Generate narration of ~{word_count} words that:
+1. Introduces the paper's motivation and context
+2. Discusses each pre-selected passage in page order, quoting or paraphrasing it
+3. Connects passages with smooth transitions
+4. Ends with key takeaways
+
+Also generate a timeline of viewer commands.
+
+Output ONLY valid JSON — no markdown, no code fences:
+{{
+  "narration": "<full narration text, ~{word_count} words>",
+  "timeline": [
+    {{"at_char": 0, "cmd": "go_page 1"}}
+  ]
+}}
+
+Timeline rules:
+- at_char: 0-based character index in narration where the command fires
+- Available commands:
+    go_page <n>                       — navigate to page n (1-indexed)
+    show_link <id>                    — pop up a figure or reference preview
+    highlight <color> "<text>" <page> — suggest a permanent highlight (page 1-indexed)
+      color: agree | disagree | comment | question | definition | other
+    focus "<exact text>" <page>       — dashed focus box (4–8 word verbatim quote)
+- For EACH pre-selected passage: include go_page + focus just before narrating it
+  focus text must EXACTLY match the "text" field of that plan item (copy verbatim)
+- Include show_link for 1–2 figures if available
+- Include 0–2 additional highlight suggestions beyond the plan
 - First event must be {{"at_char": 0, "cmd": "go_page 1"}}
 """
 
@@ -571,6 +731,7 @@ def _generate_tour_sync(
     duration: str,
     figures: list[dict],
     pdf_links: list[dict],
+    plan_items: list[dict] | None = None,
 ) -> dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -587,13 +748,27 @@ def _generate_tour_sync(
         f"{l['id']} (p.{l['destPage'] + 1})" for l in pdf_links[:15]
     ) or "(none)"
 
-    prompt = _TOUR_PROMPT.format(
-        system_prompt=system_prompt,
-        duration=duration,
-        word_count=word_count,
-        figure_list=figure_list,
-        link_list=link_list,
-    )
+    if plan_items:
+        plan_list = "\n".join(
+            f"  [p.{item['page']} | {item['type']}] \"{item['text']}\" — {item.get('note', '')}"
+            for item in plan_items
+        )
+        prompt = _TOUR_NARRATE_PROMPT.format(
+            system_prompt=system_prompt,
+            duration=duration,
+            word_count=word_count,
+            plan_list=plan_list,
+            figure_list=figure_list,
+            link_list=link_list,
+        )
+    else:
+        prompt = _TOUR_PROMPT.format(
+            system_prompt=system_prompt,
+            duration=duration,
+            word_count=word_count,
+            figure_list=figure_list,
+            link_list=link_list,
+        )
 
     response = client.models.generate_content(
         model=TOUR_MODEL,
@@ -626,7 +801,8 @@ async def generate_tour(
     duration: str,
     figures: list[dict],
     pdf_links: list[dict],
+    plan_items: list[dict] | None = None,
 ) -> dict[str, Any]:
     return await asyncio.to_thread(
-        _generate_tour_sync, system_prompt, duration, figures, pdf_links
+        _generate_tour_sync, system_prompt, duration, figures, pdf_links, plan_items
     )

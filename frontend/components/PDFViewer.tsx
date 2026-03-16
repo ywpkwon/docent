@@ -67,11 +67,13 @@ interface PageViewProps {
   onRenderComplete?: (pageNum: number) => void;
   showROI: boolean;
   onFigureChange?: (fig: FigureBBox) => void;
+  focusRect?: HighlightRect | null;
 }
 
 const PageView = forwardRef<HTMLDivElement, PageViewProps>(function PageView(
   { pdf, pageNum, renderScale, displayScale, overlaysVisible, interactiveLayersEnabled, highlights, figures, legends,
-    onTextChange, onHighlight, navigateTo, onFigurePopup, onPreviewPopup, onRenderComplete, showROI, onFigureChange },
+    onTextChange, onHighlight, navigateTo, onFigurePopup, onPreviewPopup, onRenderComplete, showROI, onFigureChange,
+    focusRect },
   ref
 ) {
   const canvasRefs    = useRef<Array<HTMLCanvasElement | null>>([null, null]);
@@ -440,6 +442,23 @@ const PageView = forwardRef<HTMLDivElement, PageViewProps>(function PageView(
             }}
           />
         ))}
+
+        {/* Tour focus band — dashed box around the currently-narrated passage */}
+        {activePageDims && focusRect && (
+          <div style={{
+            position: "absolute",
+            left:   focusRect.x * activePageDims.cssW - 4,
+            top:    focusRect.y * activePageDims.cssH - 4,
+            width:  focusRect.w * activePageDims.cssW + 8,
+            height: focusRect.h * activePageDims.cssH + 8,
+            border: "2px dashed rgba(251,191,36,0.9)",
+            borderRadius: 4,
+            boxSizing: "border-box",
+            background: "rgba(251,191,36,0.07)",
+            pointerEvents: "none",
+            zIndex: 15,
+          }} />
+        )}
       </div>
 
       {pendingSel && (
@@ -451,7 +470,207 @@ const PageView = forwardRef<HTMLDivElement, PageViewProps>(function PageView(
 });
 
 // ─── Link extraction helpers ──────────────────────────────────────────────────
-type TextItem = { str: string; transform: number[]; width: number; height: number };
+type TextItem = { str: string; transform: number[]; width: number; height: number; fontFamily?: string };
+
+/**
+ * Measure the ascent ratio (ascent / (ascent + descent)) of a CSS font family
+ * using the same Canvas-based technique that PDF.js TextLayer uses internally.
+ * Results are cached so each font family is measured only once.
+ */
+const _ascentRatioCache = new Map<string, number>();
+function getAscentRatio(fontFamily: string | undefined): number {
+  const key = fontFamily ?? "";
+  const cached = _ascentRatioCache.get(key);
+  if (cached !== undefined) return cached;
+  const DEFAULT = 0.82;
+  if (!fontFamily || typeof document === "undefined") return DEFAULT;
+  try {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return DEFAULT;
+    ctx.font = `1000px ${fontFamily}`;
+    const m = ctx.measureText("Àgy");
+    const asc  = m.fontBoundingBoxAscent  ?? 0;
+    const desc = Math.abs(m.fontBoundingBoxDescent ?? 0);
+    const ratio = asc && desc ? asc / (asc + desc) : DEFAULT;
+    _ascentRatioCache.set(key, ratio);
+    return ratio;
+  } catch {
+    return DEFAULT;
+  }
+}
+
+/**
+ * Search for `searchText` in a page's text items and return one tight
+ * HighlightRect per visual line (0–1 fractional coords), or [] if not found.
+ *
+ * Items are grouped by baseline Y (within LINE_THRESHOLD PDF units) into lines.
+ * Each line rect uses ASCENT/DESCENT fractions of item.height so the boxes
+ * match the visual text height produced by browser getClientRects() on a
+ * manual text selection.
+ */
+/** Normalize text for matching: ligatures, typographic punctuation, math symbols, whitespace. */
+function normForSearch(s: string): string {
+  return s.normalize("NFKC")                         // ﬁ→fi, ﬀ→ff, math-italic 𝑜→o, …
+    .replace(/[\u2018\u2019]/g, "'")                 // smart single quotes
+    .replace(/[\u201c\u201d]/g, '"')                 // smart double quotes
+    .replace(/[\u2013\u2014]/g, "-")                 // en/em dash
+    .replace(/\u00ad/g, "")                          // soft hyphen
+    .replace(/\u00d7/g, "x")                         // × → x  (LaTeX \times, "5× fewer")
+    .replace(/[\u22c5\u2219\u00b7]/g, ".")           // math dot operators → .
+    .replace(/\u03b1/g, "alpha").replace(/\u03b2/g, "beta")  // common Greek
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Compute highlight rects from a set of matched TextItems. */
+function rectsFromItems(items: TextItem[], metric: PageMetric): HighlightRect[] {
+  const { width: pageW, height: pageH } = metric;
+  const LINE_THRESH = 4;
+  const X_PAD = 0.003;
+  const lines: Array<{ items: TextItem[]; refY: number }> = [];
+  for (const item of items) {
+    const y = item.transform[5];
+    const existing = lines.find((l) => Math.abs(l.refY - y) <= LINE_THRESH);
+    if (existing) existing.items.push(item);
+    else lines.push({ refY: y, items: [item] });
+  }
+  lines.sort((a, b) => b.refY - a.refY);
+  return lines.map(({ items: lineItems }) => {
+    let minX = Infinity, maxX = -Infinity, pdfTop = -Infinity, pdfBot = Infinity;
+    for (const item of lineItems) {
+      const x = item.transform[4], y = item.transform[5];
+      const h = item.height || 10, w = item.width || 0;
+      const asc = getAscentRatio(item.fontFamily);
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x + w);
+      pdfTop = Math.max(pdfTop, y + asc * h);
+      pdfBot = Math.min(pdfBot, y - (1 - asc) * h);
+    }
+    return {
+      x: Math.max(0, minX / pageW - X_PAD),
+      y: Math.max(0, 1 - pdfTop / pageH),
+      w: Math.min(1, (maxX - minX) / pageW + X_PAD * 2),
+      h: Math.min(1, (pdfTop - pdfBot) / pageH),
+    };
+  });
+}
+
+function searchTextRects(
+  searchText: string,
+  textItems: TextItem[],
+  metric: PageMetric,
+): HighlightRect[] {
+  // --- Pass 1: normalized character-level substring match ---
+  let fullText = "";
+  const ranges: { start: number; end: number; item: TextItem }[] = [];
+  for (const item of textItems) {
+    if (!item.str) continue;
+    const norm = normForSearch(item.str);
+    ranges.push({ start: fullText.length, end: fullText.length + norm.length, item });
+    fullText += norm;
+    if (!norm.endsWith(" ")) fullText += " ";
+  }
+  const needle = normForSearch(searchText).toLowerCase();
+  const idx = fullText.toLowerCase().indexOf(needle);
+  if (idx !== -1) {
+    const matchEnd = idx + needle.length;
+    const { width: pageW, height: pageH } = metric;
+    const LINE_THRESH = 4;
+    const X_PAD = 0.003;
+
+    // For each overlapping item, clip x to the portion actually covered by the match.
+    // This prevents the highlight from spanning "hours. I-JEPA..." when only "I-JEPA..."
+    // is matched — the proportional fraction approximates where the match starts/ends
+    // within the item's bounding box.
+    type Clipped = { item: TextItem; x0: number; x1: number };
+    const clipped: Clipped[] = ranges
+      .filter((r) => r.end > idx && r.start < matchEnd)
+      .map((r) => {
+        const normLen = r.end - r.start;
+        const f0 = normLen > 0 ? Math.max(0, idx - r.start) / normLen : 0;
+        const f1 = normLen > 0 ? Math.min(normLen, matchEnd - r.start) / normLen : 1;
+        const x = r.item.transform[4];
+        const w = r.item.width || 0;
+        return { item: r.item, x0: x + f0 * w, x1: x + f1 * w };
+      });
+
+    if (clipped.length > 0) {
+      const lines: Array<{ items: Clipped[]; refY: number }> = [];
+      for (const ci of clipped) {
+        const y = ci.item.transform[5];
+        const existing = lines.find((l) => Math.abs(l.refY - y) <= LINE_THRESH);
+        if (existing) existing.items.push(ci);
+        else lines.push({ refY: y, items: [ci] });
+      }
+      lines.sort((a, b) => b.refY - a.refY);
+      return lines.map(({ items }) => {
+        let minX = Infinity, maxX = -Infinity, pdfTop = -Infinity, pdfBot = Infinity;
+        for (const ci of items) {
+          const y = ci.item.transform[5];
+          const h = ci.item.height || 10;
+          const asc = getAscentRatio(ci.item.fontFamily);
+          minX = Math.min(minX, ci.x0);
+          maxX = Math.max(maxX, ci.x1);
+          pdfTop = Math.max(pdfTop, y + asc * h);
+          pdfBot = Math.min(pdfBot, y - (1 - asc) * h);
+        }
+        return {
+          x: Math.max(0, minX / pageW - X_PAD),
+          y: Math.max(0, 1 - pdfTop / pageH),
+          w: Math.min(1, (maxX - minX) / pageW + X_PAD * 2),
+          h: Math.min(1, (pdfTop - pdfBot) / pageH),
+        };
+      });
+    }
+  }
+
+  // --- Pass 2: word-level fallback ---
+  // Match the alpha words from the needle as an ordered sequence in the item stream,
+  // allowing math symbols / encoding artifacts between words.
+  // This handles cases like italic fonts using different codepoints, or math operators
+  // that survive normalization differently between Gemini Vision and PDF.js.
+  const needleWords = needle.match(/[a-z]+/g) ?? [];
+  if (needleWords.length < 3) return []; // too few words — too likely to false-match
+
+  type IW = { word: string; item: TextItem };
+  const iwList: IW[] = [];
+  for (const item of textItems) {
+    for (const w of (normForSearch(item.str).toLowerCase().match(/[a-z]+/g) ?? []))
+      iwList.push({ word: w, item });
+  }
+
+  const maxGap = needleWords.length + 3; // allow up to 3 extra tokens between needle words
+  for (let i = 0; i <= iwList.length - needleWords.length; i++) {
+    if (iwList[i].word !== needleWords[0]) continue;
+    const matched: TextItem[] = [];
+    let j = 0;
+    for (let k = i; k < i + maxGap && k < iwList.length && j < needleWords.length; k++) {
+      if (iwList[k].word === needleWords[j]) { matched.push(iwList[k].item); j++; }
+    }
+    if (j === needleWords.length) return rectsFromItems([...new Set(matched)], metric);
+  }
+
+  return [];
+}
+
+/**
+ * Returns the bounding union of all line rects from searchTextRects.
+ * Used for the tour focus band overlay (a single dashed box around all lines).
+ */
+function searchTextRect(
+  searchText: string,
+  textItems: TextItem[],
+  metric: PageMetric,
+): HighlightRect | null {
+  const rects = searchTextRects(searchText, textItems, metric);
+  if (rects.length === 0) return null;
+  let x1 = 1, y1 = 1, x2 = 0, y2 = 0;
+  for (const r of rects) {
+    x1 = Math.min(x1, r.x);         y1 = Math.min(y1, r.y);
+    x2 = Math.max(x2, r.x + r.w);   y2 = Math.max(y2, r.y + r.h);
+  }
+  return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+}
 
 /** Find a [N] reference label near destPdfY on the destination page.
  *  Looks at text items on the DESTINATION page rather than the source annotation,
@@ -509,11 +728,16 @@ interface Props {
   onFiguresChange: (figs: FigureBBox[]) => void;
   onScaleChange?: (scale: number) => void;
   onLinksReady?: (links: PdfLink[]) => void;
+  /** Tour focus band — shows a dashed box around the narrated passage */
+  focusBand?: { text: string; page: number } | null;
+  /** Called with resolved rects for tour highlights that had no rects */
+  onHighlightRects?: (updates: { id: string; rects: HighlightRect[]; page?: number }[]) => void;
 }
 
 export function PDFViewer({
   pdfUrl, currentPage, pageCount, highlights, figures, legends,
   onPageChange, onFigurePopup, onHighlight, onCurrentTextChange, onFiguresChange, onScaleChange, onLinksReady,
+  focusBand, onHighlightRects,
 }: Props) {
   const scrollContainerRef  = useRef<HTMLDivElement>(null);
   const snapshotHostRef     = useRef<HTMLDivElement>(null);
@@ -536,6 +760,11 @@ export function PDFViewer({
   useEffect(() => { currentPageRef.current = currentPage; }, [currentPage]);
   useEffect(() => { pageCountRef.current = pageCount; }, [pageCount]);
   useEffect(() => { onPageChangeRef.current = onPageChange; }, [onPageChange]);
+
+  // Text items per page — loaded once, used for tour focus text search
+  const allPageTextRef = useRef<TextItem[][]>([]);
+  // Computed fractional rect for the current tour focus band
+  const [focusRect, setFocusRect] = useState<HighlightRect | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [showROI, setShowROI] = useState(false);
@@ -841,11 +1070,13 @@ export function PDFViewer({
               page.getAnnotations(),
               page.getTextContent(),
             ]);
+            const styles = (textContent as { styles?: Record<string, { fontFamily?: string }> }).styles ?? {};
             const textItems: TextItem[] = textContent.items
               .filter((it) => "str" in it)
               .map((it) => {
-                const i = it as { str: string; transform: number[]; width: number; height: number };
-                return { str: i.str, transform: i.transform, width: i.width, height: i.height };
+                const i = it as { str: string; transform: number[]; width: number; height: number; fontName?: string };
+                const fontFamily = i.fontName ? styles[i.fontName]?.fontFamily : undefined;
+                return { str: i.str, transform: i.transform, width: i.width, height: i.height, fontFamily };
               });
             return { metric, annotations, textItems };
           } catch {
@@ -856,6 +1087,7 @@ export function PDFViewer({
 
       if (!cancelled) {
         setPageMetrics(allPageData.map((d) => d.metric));
+        allPageTextRef.current = allPageData.map((d) => d.textItems);
         setLoading(false);
       }
 
@@ -962,6 +1194,47 @@ export function PDFViewer({
     })();
     return () => { cancelled = true; };
   }, [pdfUrl]);
+
+  // Compute focus rect from tour focus band by searching PDF text items
+  useEffect(() => {
+    if (!focusBand) { setFocusRect(null); return; }
+    const { text, page } = focusBand;
+    const textItems = allPageTextRef.current[page] ?? [];
+    const metric = pageMetrics[page];
+    if (!metric || textItems.length === 0) { setFocusRect(null); return; }
+    setFocusRect(searchTextRect(text, textItems, metric));
+  }, [focusBand, pageMetrics]);
+
+  // Resolve per-line rects for tour highlights that have text but no rects yet.
+  // If text isn't found on the claimed page (Gemini sometimes returns the wrong page),
+  // fall back and search all currently-loaded pages.
+  useEffect(() => {
+    if (!onHighlightRects || pageMetrics.length === 0) return;
+    const toResolve = highlights.filter((h) => h.source === "tour" && !h.rects && h.text);
+    if (toResolve.length === 0) return;
+    const updates: { id: string; rects: HighlightRect[]; page?: number }[] = [];
+    for (const hl of toResolve) {
+      const textItems = allPageTextRef.current[hl.page] ?? [];
+      const metric = pageMetrics[hl.page];
+      const rects = metric && textItems.length > 0
+        ? searchTextRects(hl.text, textItems, metric)
+        : [];
+      if (rects.length > 0) {
+        updates.push({ id: hl.id, rects });
+      } else {
+        // Text not found on claimed page — search all loaded pages
+        for (const [pageIdxStr, pageItems] of Object.entries(allPageTextRef.current)) {
+          const pg = parseInt(pageIdxStr);
+          if (pg === hl.page) continue;
+          const m = pageMetrics[pg];
+          if (!m || pageItems.length === 0) continue;
+          const fallback = searchTextRects(hl.text, pageItems, m);
+          if (fallback.length > 0) { updates.push({ id: hl.id, rects: fallback, page: pg }); break; }
+        }
+      }
+    }
+    if (updates.length > 0) onHighlightRects(updates);
+  }, [highlights, pageMetrics, onHighlightRects]);
 
   useEffect(() => {
     const el = scrollContainerRef.current;
@@ -1189,6 +1462,7 @@ export function PDFViewer({
                     onPreviewPopup={setPreviewPopup}
                     showROI={showROI}
                     onFigureChange={(fig) => onFiguresChange(figures.map((f) => f.id === fig.id ? fig : f))}
+                    focusRect={focusBand?.page === pageNum ? focusRect : null}
                   />
                 ) : (
                   <div

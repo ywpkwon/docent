@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""
+Dev tool: test the command-parsing pipeline without the UI.
+
+Usage:
+  ./parse_command "[8]"
+  ./parse_command "show figure 3"
+  ./parse_command "can you show me reference 8?"
+  ./parse_command "go to page 5"
+
+Shows which layer matched (exact / local regex / gemini) and the resulting command.
+"""
+
+import json
+import re
+import sys
+import urllib.request
+from pathlib import Path
+
+# ── Read .env for PARSE_MODEL / backend URL ───────────────────────────────────
+def _read_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                env[k.strip()] = v.strip()
+    return env
+
+ENV = _read_env()
+PARSE_MODEL = ENV.get("PARSE_MODEL", "gemini-2.0-flash")
+BACKEND     = ENV.get("BACKEND_URL", "http://localhost:8000")
+
+# ── Layer 1: exact command syntax ─────────────────────────────────────────────
+_COMMANDS = {
+    "next_page", "prev_page", "go_page", "show_link", "highlight",
+    "next_highlight", "prev_highlight", "change_highlight", "none",
+}
+
+def parse_exact(text: str) -> str | None:
+    parts = text.strip().split()
+    if parts and parts[0].lower() in _COMMANDS:
+        return " ".join([parts[0].lower()] + parts[1:])
+    return None
+
+# ── Layer 2: local natural-language regex (mirrors frontend/lib/commands.ts) ──
+_COLORS = "agree|disagree|comment|question|definition|other"
+
+def parse_local(text: str) -> str | None:
+    t = text.strip().lower()
+
+    # Page navigation
+    if re.search(r"\b(next page|go forward|forward|next)\b", t):
+        return "next_page"
+    if re.search(r"\b(prev(ious)? page|go back(ward)?|previous|back)\b", t):
+        return "prev_page"
+    m = re.search(r"\b(?:go\s+to\s+)?page\s+(\d+)\b", t) or \
+        re.search(r"\bjump\s+to\s+(?:page\s+)?(\d+)\b", t)
+    if m:
+        return f"go_page {m.group(1)}"
+
+    # Figure / table / algorithm
+    m = re.search(r"\b(?:show|open|display|preview)\s+fig(?:ure)?\s*(\d+)\b", t) or \
+        re.search(r"\bfig(?:ure)?\s*(\d+)\b", t)
+    if m:
+        return f"show_link fig{m.group(1)}"
+
+    m = re.search(r"\b(?:show|open|display|preview)\s+table\s*(\d+)\b", t) or \
+        re.search(r"\btable\s*(\d+)\b", t)
+    if m:
+        return f"show_link table{m.group(1)}"
+
+    m = re.search(r"\b(?:show|open|display|preview)\s+alg(?:orithm)?\s*(\d+)\b", t)
+    if m:
+        return f"show_link alg{m.group(1)}"
+
+    # Reference / citation — check original text for [n] to preserve brackets
+    m = re.search(r"\b(?:show|open|display|preview)\s+ref(?:erence)?\s*(\d+)\b", t) or \
+        re.search(r"\bref(?:erence)?\s*(\d+)\b", t) or \
+        re.search(r"\bcitation\s*(\d+)\b", t) or \
+        re.search(r"\[(\d+)\]", text)
+    if m:
+        return f"show_link ref{m.group(1)}"
+
+    # Highlight
+    m = re.search(rf"\b(?:highlight|mark|annotate)\b.*\b({_COLORS})\b", t) or \
+        re.search(rf"\b({_COLORS})\b.*\b(?:highlight|mark)\b", t)
+    if m:
+        return f"highlight {m.group(1)}"
+
+    # Highlight navigation
+    m = re.search(rf"\bnext\s+highlight(?:\s+({_COLORS}))?\b", t)
+    if m:
+        return f"next_highlight {m.group(1) or ''}".strip()
+    m = re.search(rf"\bprev(?:ious)?\s+highlight(?:\s+({_COLORS}))?\b", t)
+    if m:
+        return f"prev_highlight {m.group(1) or ''}".strip()
+
+    return None
+
+# ── Layer 3: Gemini via running backend ───────────────────────────────────────
+def parse_gemini(text: str) -> dict:
+    payload = json.dumps({
+        "user_message": text,
+        "system_prompt": "(dev test — no paper loaded)",
+        "current_page": 1,
+        "page_count": 1,
+    }).encode()
+    req = urllib.request.Request(
+        f"{BACKEND}/api/command",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: ./parse_command <input phrase>")
+        sys.exit(1)
+
+    text = " ".join(sys.argv[1:])
+    print(f'input: "{text}"')
+    print()
+
+    # Layer 1
+    result = parse_exact(text)
+    if result:
+        print(f"  ✓ exact        →  {result}")
+        return
+    print(f"  ✗ exact        →  no match")
+
+    # Layer 2
+    result = parse_local(text)
+    if result:
+        print(f"  ✓ local regex  →  {result}")
+        return
+    print(f"  ✗ local regex  →  no match")
+
+    # Layer 3
+    print(f"  ? {PARSE_MODEL}  →  calling backend...", end=" ", flush=True)
+    try:
+        data = parse_gemini(text)
+        cmd    = data.get("command", "none")
+        speech = data.get("speech", "")
+        model  = data.get("model", PARSE_MODEL)
+        print(f"\r  ✓ {model}  →  {cmd}")
+        if speech:
+            print(f"    speech: \"{speech[:100]}\"")
+    except Exception as e:
+        print(f"\r  ✗ {PARSE_MODEL}  →  ERROR: {e}")
+
+if __name__ == "__main__":
+    main()

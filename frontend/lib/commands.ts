@@ -93,6 +93,62 @@ export function parseCommand(input: string): ParsedCommand | null {
   return { name, args: parts.slice(1), raw: trimmed };
 }
 
+const COLORS = ["agree", "disagree", "comment", "question", "definition", "other"];
+
+/**
+ * Local natural-language → command mapping.
+ * Handles common spoken/typed phrases without an API round-trip.
+ * Returns null when no pattern matches (caller should fall back to Gemini).
+ */
+export function parseNaturalCommand(input: string): ParsedCommand | null {
+  const s = input.trim().toLowerCase();
+  const cmd = (name: string, args: string[]): ParsedCommand => ({ name, args, raw: input });
+
+  // ── Page navigation ──────────────────────────────────────────────────────
+  if (/\b(next page|go forward|forward|next)\b/.test(s))
+    return cmd("next_page", []);
+  if (/\b(prev(ious)? page|go back(ward)?|previous|back)\b/.test(s))
+    return cmd("prev_page", []);
+
+  let m: RegExpMatchArray | null;
+  if ((m = s.match(/\b(?:go\s+to\s+)?page\s+(\d+)\b/)) ||
+      (m = s.match(/\bjump\s+to\s+(?:page\s+)?(\d+)\b/)))
+    return cmd("go_page", [m[1]]);
+
+  // ── Show figure / table / algorithm ─────────────────────────────────────
+  if ((m = s.match(/\b(?:show|open|display|preview)\s+fig(?:ure)?\s*(\d+)\b/)) ||
+      (m = s.match(/\bfig(?:ure)?\s*(\d+)\b/)))
+    return cmd("show_link", [`fig${m[1]}`]);
+
+  if ((m = s.match(/\b(?:show|open|display|preview)\s+table\s*(\d+)\b/)) ||
+      (m = s.match(/\btable\s*(\d+)\b/)))
+    return cmd("show_link", [`table${m[1]}`]);
+
+  if ((m = s.match(/\b(?:show|open|display|preview)\s+alg(?:orithm)?\s*(\d+)\b/)))
+    return cmd("show_link", [`alg${m[1]}`]);
+
+  // ── Show reference / citation ────────────────────────────────────────────
+  if ((m = s.match(/\b(?:show|open|display|preview)\s+ref(?:erence)?\s*(\d+)\b/)) ||
+      (m = s.match(/\bref(?:erence)?\s*(\d+)\b/)) ||
+      (m = s.match(/\bcitation\s*(\d+)\b/)) ||
+      (m = s.match(/\[(\d+)\]/)))
+    return cmd("show_link", [`ref${m[1]}`]);
+
+  // ── Highlight ────────────────────────────────────────────────────────────
+  if ((m = s.match(/\b(?:highlight|mark|annotate)\b.*\b(agree|disagree|comment|question|definition|other)\b/)) ||
+      (m = s.match(/\b(agree|disagree|comment|question|definition|other)\b.*\b(?:highlight|mark)\b/)))
+    return cmd("highlight", [m[1]]);
+
+  // ── Highlight navigation ─────────────────────────────────────────────────
+  const colorPat = COLORS.join("|");
+  if ((m = s.match(new RegExp(`\\bnext\\s+highlight(?:\\s+(${colorPat}))?\\b`))))
+    return cmd("next_highlight", m[1] ? [m[1]] : []);
+  if ((m = s.match(new RegExp(`\\bprev(?:ious)?\\s+highlight(?:\\s+(${colorPat}))?\\b`))))
+    return cmd("prev_highlight", m[1] ? [m[1]] : []);
+
+  return null;
+}
+
 /**
  * Find the CommandDef whose name matches the beginning of the user's input.
  * Used for inline syntax hints in the command bar.

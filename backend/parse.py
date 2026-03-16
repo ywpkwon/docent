@@ -505,6 +505,7 @@ def _run_command_sync(
     return {
         "speech": data.get("speech") or "",
         "command": data.get("command") or "none",
+        "model": PARSE_MODEL,
     }
 
 

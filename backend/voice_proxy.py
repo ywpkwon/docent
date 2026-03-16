@@ -1,15 +1,18 @@
 """
 WebSocket proxy between the browser and Gemini Live API.
 
+Used purely as a speech-to-text layer: user audio → Gemini Live input
+transcription → transcript string sent to browser → browser runs the
+transcript through the same parseNaturalCommand / handleCommand pipeline
+as typed text commands.
+
 Browser protocol (JSON frames):
   → {"type": "setup", "system_prompt": "...", "paper_meta": {...}}
   → {"type": "audio", "data": "<base64 PCM 16kHz mono int16>"}
   → {"type": "interrupt"}
 
-  ← {"type": "audio", "data": "<base64 PCM 24kHz mono int16>"}
-  ← {"type": "action", "action": {"type": "...", ...}}
-  ← {"type": "transcript", "text": "..."}
-  ← {"type": "status", "status": "listening|thinking|speaking|interrupted"}
+  ← {"type": "transcript", "text": "<user's spoken words>"}
+  ← {"type": "status", "status": "listening|thinking|interrupted"}
   ← {"type": "error", "message": "..."}
 """
 from __future__ import annotations
@@ -19,8 +22,6 @@ import base64
 import json
 import logging
 import os
-from typing import Any
-
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -38,12 +39,10 @@ def _make_setup_msg(system_prompt: str) -> dict:
         "setup": {
             "model": f"models/{LIVE_MODEL}",
             "generation_config": {
-                "response_modalities": ["AUDIO"],
-                "speech_config": {
-                    "voice_config": {
-                        "prebuilt_voice_config": {"voice_name": "Puck"}
-                    }
-                },
+                # Text-only responses — we use the live model purely for STT.
+                # Commands are routed through the text pipeline on the frontend.
+                "response_modalities": ["TEXT"],
+                "input_audio_transcription": {},
             },
             "system_instruction": {
                 "parts": [{"text": system_prompt}]
@@ -71,58 +70,6 @@ def _make_tool_response(call_id: str, output: str = "ok") -> dict:
         }
     }
 
-
-def _command_str_to_action(command: str) -> dict | None:
-    """Convert a canonical command string (e.g. 'go_page 5') to a VoiceAction dict."""
-    parts = command.strip().split()
-    if not parts:
-        return None
-    name, args = parts[0], parts[1:]
-    if name == "next_page":
-        return {"type": "PAGE_RELATIVE", "delta": 1}
-    if name == "prev_page":
-        return {"type": "PAGE_RELATIVE", "delta": -1}
-    if name == "go_page" and args:
-        try:
-            return {"type": "PAGE_NAV", "page": int(args[0])}
-        except ValueError:
-            return None
-    if name in ("show_fig", "show_link") and args:
-        return {"type": "SHOW_FIGURE", "figure_id": args[0]}
-    if name == "highlight" and args:
-        return {"type": "HIGHLIGHT", "color": args[0], "note": ""}
-    return None
-
-
-def _extract_action_from_text(text: str) -> tuple[str, dict | None]:
-    """
-    Parse the JSON envelope from Gemini's text response.
-    Supports both formats:
-      New: { "speech": "...", "command": "go_page 5" }
-      Old: { "speech": "...", "action": { "type": "PAGE_NAV", ... } }
-    Returns (speech_text, action_dict_or_none).
-    """
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
-
-    try:
-        envelope = json.loads(text)
-        speech = envelope.get("speech", "")
-
-        # New format: command string
-        command = envelope.get("command")
-        if command and command != "none":
-            return speech, _command_str_to_action(command)
-
-        # Old format: action object (backward compat)
-        action = envelope.get("action")
-        if action and action.get("type") == "NONE":
-            action = None
-        return speech, action
-    except (json.JSONDecodeError, AttributeError):
-        return text, None
 
 
 async def run_voice_session(browser_ws: WebSocket) -> None:
@@ -191,7 +138,6 @@ async def run_voice_session(browser_ws: WebSocket) -> None:
                     logger.exception("browser_to_gemini error: %s", exc)
 
             async def gemini_to_browser() -> None:
-                accumulated_text: list[str] = []
                 try:
                     async for raw in gemini_ws:
                         if isinstance(raw, bytes):
@@ -206,60 +152,26 @@ async def run_voice_session(browser_ws: WebSocket) -> None:
                         if "setupComplete" in msg:
                             continue
 
-                        # Server content (audio + text)
+                        # Input transcription — user's spoken words → send to browser
+                        # as a transcript so the frontend can run it through the same
+                        # text-command pipeline (exact → NLP regex → /api/command).
+                        input_trans = msg.get("inputTranscription") or msg.get("input_transcription")
+                        if input_trans:
+                            text = (input_trans.get("text") or "").strip()
+                            finished = input_trans.get("finished", False)
+                            if finished and text:
+                                logger.debug("STT transcript: %r", text)
+                                await browser_ws.send_json({"type": "transcript", "text": text})
+
+                        # Turn complete → go back to listening
                         server_content = msg.get("serverContent") or msg.get("server_content")
                         if server_content:
-                            model_turn = server_content.get("modelTurn") or server_content.get("model_turn", {})
-                            parts = model_turn.get("parts", [])
-
-                            for part in parts:
-                                # Audio chunk
-                                inline = part.get("inlineData") or part.get("inline_data")
-                                if inline:
-                                    await browser_ws.send_json({
-                                        "type": "audio",
-                                        "data": inline.get("data", ""),
-                                    })
-                                    await browser_ws.send_json({"type": "status", "status": "speaking"})
-
-                                # Text chunk (our JSON envelope)
-                                text = part.get("text")
-                                if text:
-                                    accumulated_text.append(text)
-
                             turn_complete = server_content.get("turnComplete") or server_content.get("turn_complete")
                             if turn_complete:
-                                # Process accumulated text for action
-                                if accumulated_text:
-                                    full_text = "".join(accumulated_text)
-                                    speech, action = _extract_action_from_text(full_text)
-                                    if speech:
-                                        await browser_ws.send_json({"type": "transcript", "text": speech})
-                                    if action:
-                                        await browser_ws.send_json({"type": "action", "action": action})
-                                    accumulated_text.clear()
-
                                 await browser_ws.send_json({"type": "status", "status": "listening"})
-
-                        # Tool call (function calling)
-                        tool_call = msg.get("toolCall") or msg.get("tool_call")
-                        if tool_call:
-                            fn_calls = tool_call.get("functionCalls") or tool_call.get("function_calls", [])
-                            for fn in fn_calls:
-                                call_id = fn.get("id", "")
-                                name = fn.get("name", "")
-                                args = fn.get("args", {})
-
-                                action = _fn_call_to_action(name, args)
-                                if action:
-                                    await browser_ws.send_json({"type": "action", "action": action})
-
-                                # Acknowledge tool call
-                                await gemini_ws.send(json.dumps(_make_tool_response(call_id)))
 
                         # Interrupted
                         if msg.get("interrupted"):
-                            accumulated_text.clear()
                             await browser_ws.send_json({"type": "status", "status": "interrupted"})
 
                 except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
@@ -278,19 +190,3 @@ async def run_voice_session(browser_ws: WebSocket) -> None:
             await browser_ws.send_json({"type": "error", "message": f"Gemini connection failed: {exc}"})
         except Exception:
             pass
-
-
-def _fn_call_to_action(name: str, args: dict[str, Any]) -> dict | None:
-    """Convert a Gemini function call to our action format."""
-    mapping = {
-        "navigate_page": lambda a: {"type": "PAGE_NAV", "page": a.get("page_number", 1)},
-        "navigate_relative": lambda a: {"type": "PAGE_RELATIVE", "delta": a.get("delta", 0)},
-        "show_figure": lambda a: {"type": "SHOW_FIGURE", "figure_id": a.get("figure_id", "")},
-        "add_highlight": lambda a: {
-            "type": "HIGHLIGHT",
-            "color": a.get("color", "yellow"),
-            "note": a.get("note", ""),
-        },
-    }
-    fn = mapping.get(name)
-    return fn(args) if fn else None

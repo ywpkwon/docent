@@ -54,18 +54,9 @@ export interface ParsedPaper {
   system_prompt: string;
 }
 
-// Actions dispatched by the voice layer
-export type VoiceAction =
-  | { type: "PAGE_NAV"; page: number }
-  | { type: "PAGE_RELATIVE"; delta: number }
-  | { type: "SHOW_FIGURE"; figure_id: string }
-  | { type: "HIGHLIGHT"; color: HighlightColor; note: string }
-  | { type: "NONE" };
-
 // Messages from the backend WebSocket
 export type WsMessage =
   | { type: "audio"; data: string }
-  | { type: "action"; action: VoiceAction }
   | { type: "transcript"; text: string }
   | { type: "status"; status: VoiceStatus }
   | { type: "error"; message: string };

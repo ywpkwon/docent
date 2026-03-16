@@ -13,7 +13,7 @@ import { QuickLink } from "@/components/QuickLink";
 import { TourPlayer } from "@/components/TourPlayer";
 import { createHighlight, exportToObsidian } from "@/lib/highlights";
 import { loadLegends, saveLegends } from "@/lib/legends";
-import { parseCommand, type ParsedCommand } from "@/lib/commands";
+import { parseCommand, parseNaturalCommand, type ParsedCommand } from "@/lib/commands";
 import { clearSession, loadSession, saveSession } from "@/lib/db";
 import type {
   FigureBBox,
@@ -24,7 +24,6 @@ import type {
   ParsedPaper,
   PdfLink,
   TourEvent,
-  VoiceAction,
   VoiceStatus,
 } from "@/lib/types";
 
@@ -200,25 +199,6 @@ export default function Home() {
     }
   }, [paper, currentPage, highlights, legends, figures, pdfLinks]);
 
-  // Adapter: convert legacy VoiceAction → executeCommand
-  const handleAction = useCallback((action: VoiceAction) => {
-    if (!paper) return;
-    switch (action.type) {
-      case "PAGE_NAV":
-        executeCommand({ name: "go_page", args: [String(action.page)], raw: "" });
-        break;
-      case "PAGE_RELATIVE":
-        executeCommand({ name: action.delta > 0 ? "next_page" : "prev_page", args: [], raw: "" });
-        break;
-      case "SHOW_FIGURE":
-        executeCommand({ name: "show_link", args: [action.figure_id], raw: "" });
-        break;
-      case "HIGHLIGHT":
-        executeCommand({ name: "highlight", args: [action.color], raw: "" });
-        break;
-    }
-  }, [paper, executeCommand]);
-
   const handlePageChange = useCallback((page: number) => {
     setCurrentPage(page);
     if (paper) currentPageTextRef.current = paper.pages[page]?.text ?? "";
@@ -360,6 +340,12 @@ export default function Home() {
       return { speech: "" };
     }
 
+    const nlpCmd = parseNaturalCommand(text);
+    if (nlpCmd && nlpCmd.name !== "none") {
+      executeCommand(nlpCmd);
+      return { speech: "" };
+    }
+
     try {
       const res = await fetch(`${BACKEND_URL}/api/command`, {
         method: "POST",
@@ -380,6 +366,17 @@ export default function Home() {
       return { speech: "Network error — is the backend running?" };
     }
   }, [paper, currentPage, executeCommand]);
+
+  // Voice transcript → same command pipeline as typed text
+  const handleVoiceTranscript = useCallback(async (text: string) => {
+    const result = await handleCommand(text);
+    if (result?.speech) {
+      const utter = new SpeechSynthesisUtterance(result.speech);
+      utter.rate = 1.05;
+      speechSynthesis.cancel();
+      speechSynthesis.speak(utter);
+    }
+  }, [handleCommand]);
 
   if (restoring) {
     return (
@@ -417,8 +414,7 @@ export default function Home() {
         backendUrl={BACKEND_URL}
         systemPrompt={paper.system_prompt}
         onStatusChange={(s) => { setVoiceStatus(s); if (s !== "idle") setVoiceError(null); }}
-        onTranscript={() => {}}
-        onAction={handleAction}
+        onTranscript={handleVoiceTranscript}
         onError={setVoiceError}
       />
 

@@ -2,14 +2,13 @@
 
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { MicCapture, AudioPlayer } from "@/lib/audio";
-import type { VoiceAction, VoiceStatus, WsMessage } from "@/lib/types";
+import type { VoiceStatus, WsMessage } from "@/lib/types";
 
 interface Props {
   backendUrl: string;
   systemPrompt: string;
   onStatusChange: (status: VoiceStatus) => void;
   onTranscript: (text: string) => void;
-  onAction: (action: VoiceAction) => void;
   onError?: (msg: string) => void;
 }
 
@@ -19,7 +18,7 @@ export interface VoiceControllerHandle {
 }
 
 export const VoiceController = forwardRef<VoiceControllerHandle, Props>(
-  function VoiceController({ backendUrl, systemPrompt, onStatusChange, onTranscript, onAction, onError }, ref) {
+  function VoiceController({ backendUrl, systemPrompt, onStatusChange, onTranscript, onError }, ref) {
     const wsRef    = useRef<WebSocket | null>(null);
     const micRef   = useRef<MicCapture | null>(null);
     const playerRef = useRef<AudioPlayer | null>(null);
@@ -49,7 +48,6 @@ export const VoiceController = forwardRef<VoiceControllerHandle, Props>(
           try { msg = JSON.parse(event.data); } catch { return; }
           switch (msg.type) {
             case "audio":      playerRef.current?.enqueue(msg.data); break;
-            case "action":     onAction(msg.action); break;
             case "transcript": onTranscript(msg.text); break;
             case "status":     onStatusChange(msg.status); break;
             case "error":      onError?.(msg.message); stop(); break;
@@ -75,7 +73,7 @@ export const VoiceController = forwardRef<VoiceControllerHandle, Props>(
         onError?.(err instanceof Error ? err.message : "Failed to start voice session");
         stop();
       }
-    }, [wsUrl, systemPrompt, onAction, onTranscript, onStatusChange, onError, stop, active]);
+    }, [wsUrl, systemPrompt, onTranscript, onStatusChange, onError, stop, active]);
 
     const handleInterrupt = useCallback(() => {
       playerRef.current?.interrupt();

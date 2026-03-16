@@ -1,3 +1,7 @@
+<p align="center">
+<img width="120" alt="docent" src="https://github.com/user-attachments/assets/5633c616-6567-42e6-983f-8224a85e74b0" />
+</p>
+
 # Docent
 
 > Absorb a paper as fast as possible. Remember just enough of it.
